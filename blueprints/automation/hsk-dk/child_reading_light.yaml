@@ -1,0 +1,158 @@
+blueprint:
+  name: Børneværelse - læselampe (v3)
+  description: >
+    Aqara WXKG11LM via Zigbee2MQTT.
+    Single: dag/nat
+    Hold: nat
+    Double: sluk
+    Med debounce og stabil natlogik.
+  domain: automation
+  source_url: https://github.com/hsk-dk/useful-blueprints/blob/main/blueprints/automation/hsk-dk/child_reading_light.yaml
+  input:
+    action_sensor:
+      name: Action-sensor
+      selector:
+        entity:
+          domain: sensor
+
+    day_scene:
+      name: Dag-scene
+      selector:
+        entity:
+          domain: scene
+
+    night_scene:
+      name: Nat-scene
+      selector:
+        entity:
+          domain: scene
+
+    light_to_turn_off:
+      name: Lys der slukkes efter timer
+      selector:
+        entity:
+          domain: light
+
+    timer_minutes:
+      name: Timer (min)
+      default: 30
+      selector:
+        number:
+          min: 1
+          max: 180
+          step: 1
+          mode: box
+
+    night_start:
+      name: Nat starter
+      default: "20:00:00"
+      selector:
+        time: {}
+
+    night_end:
+      name: Nat slutter
+      default: "06:00:00"
+      selector:
+        time: {}
+
+    extra_single_entity:
+      name: Ekstra entity (valgfri)
+      default: ""
+      selector:
+        text: {}
+
+    extra_single_start:
+      default: "17:45:00"
+      selector:
+        time: {}
+
+    extra_single_end:
+      default: "23:00:00"
+      selector:
+        time: {}
+
+mode: restart
+
+trigger:
+  - platform: state
+    entity_id: !input action_sensor
+    to:
+      - single
+      - double
+      - hold
+    #for:
+    #  milliseconds: 150 # ← debounce
+
+variables:
+  press_type: "{{ trigger.to_state.state }}"
+  extra_single_entity: !input extra_single_entity
+
+  night_start: !input night_start
+  night_end: !input night_end
+
+  is_night: >
+    {% set now_t = now().strftime("%H:%M:%S") %}
+    {{ now_t >= night_start or now_t <= night_end }}
+
+condition: []
+
+action:
+  - choose:
+      # 🔴 DOUBLE → sluk straks
+      - conditions:
+          - condition: template
+            value_template: "{{ press_type == 'double' }}"
+        sequence:
+          - service: light.turn_off
+            target:
+              entity_id: !input light_to_turn_off
+
+      # 🟢 SINGLE / HOLD
+      - conditions:
+          - condition: template
+            value_template: "{{ press_type in ['single','hold'] }}"
+        sequence:
+          # Ekstra single action
+          - if:
+              - condition: template
+                value_template: "{{ press_type == 'single' and extra_single_entity != '' }}"
+              - condition: time
+                after: !input extra_single_start
+                before: !input extra_single_end
+            then:
+              - service: homeassistant.turn_on
+                target:
+                  entity_id: "{{ extra_single_entity }}"
+
+          # Scenevalg
+          - choose:
+              # HOLD → nat
+              - conditions:
+                  - condition: template
+                    value_template: "{{ press_type == 'hold' }}"
+                sequence:
+                  - service: scene.turn_on
+                    target:
+                      entity_id: !input night_scene
+
+              # SINGLE → nat hvis nat
+              - conditions:
+                  - condition: template
+                    value_template: "{{ press_type == 'single' and is_night }}"
+                sequence:
+                  - service: scene.turn_on
+                    target:
+                      entity_id: !input night_scene
+
+            default:
+              - service: scene.turn_on
+                target:
+                  entity_id: !input day_scene
+
+          # Timer → sluk lys
+          - delay:
+              minutes: !input timer_minutes
+
+          - service: light.turn_off
+            target:
+              entity_id: !input light_to_turn_off

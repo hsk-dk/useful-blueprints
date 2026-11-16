@@ -1,0 +1,146 @@
+blueprint:
+  name: "Wavin / Klima - mulig fast åben ventil"
+  description: >
+    Overvåger en eller flere climate-enheder og udløser én samlet reaktion,
+    hvis et eller flere rum stadig står i heating, selv om den aktuelle
+    temperatur er over setpunktet med en valgt margin.
+
+    Brug den til at finde rum, hvor en ventil muligvis står åben for længe.
+
+    Variabler, du kan bruge i den valgte reaktion:
+      - problem_count
+      - problem_names
+      - details
+
+  domain: automation
+  source_url: https://github.com/hsk-dk/useful-blueprints/blob/main/blueprints/automation/hsk-dk/wavin_stuck.yaml
+
+  input:
+    climates:
+      name: Klima-enheder
+      description: Vælg de climate-enheder, der skal overvåges
+      selector:
+        entity:
+          filter:
+            - domain: climate
+          multiple: true
+
+    tolerance_c:
+      name: Temperaturmargin over setpunkt
+      description: >
+        Alarmen betragter et rum som mistænkeligt, hvis current_temperature
+        er mindst denne værdi over target temperature, mens hvac_action
+        stadig er heating.
+      default: 0.5
+      selector:
+        number:
+          min: 0.1
+          max: 2.0
+          step: 0.1
+          unit_of_measurement: "°C"
+          mode: box
+
+    cooldown_minutes:
+      name: Cooldown mellem alarmer
+      description: >
+        Hvor længe der mindst skal gå, før automationen må reagere igen.
+        Bruges for at undgå notifikationer igen og igen ved samme problem.
+      default: 180
+      selector:
+        number:
+          min: 5
+          max: 1440
+          step: 5
+          unit_of_measurement: "min"
+          mode: box
+
+    reaction_actions:
+      name: Samlet reaktion
+      description: >
+        Vælg den handling, der skal udføres, når mindst ét rum vurderes
+        som mistænkeligt.
+
+        Du kan bruge variablerne:
+          - problem_count
+          - problem_names
+          - details
+      selector:
+        action: {}
+
+trigger:
+  - platform: homeassistant
+    event: start
+
+  - platform: time_pattern
+    minutes: "/5"
+
+  - platform: state
+    entity_id: !input climates
+    attribute: hvac_action
+
+  - platform: state
+    entity_id: !input climates
+    attribute: current_temperature
+
+  - platform: state
+    entity_id: !input climates
+    attribute: temperature
+
+variables:
+  climates: !input climates
+  tolerance_c: !input tolerance_c
+  cooldown_minutes: !input cooldown_minutes
+
+  offenders: >
+    {% set ns = namespace(items=[]) %}
+
+    {% for climate in expand(climates) %}
+      {% set entity = climate.entity_id %}
+      {% set hvac_action = state_attr(entity, 'hvac_action') %}
+      {% set current = state_attr(entity, 'current_temperature') %}
+      {% set target = state_attr(entity, 'temperature') %}
+
+      {% if hvac_action == 'heating'
+            and is_number(current)
+            and is_number(target)
+            and current | float >=
+                (target | float + tolerance_c | float) %}
+        {% set ns.items = ns.items + [entity] %}
+      {% endif %}
+    {% endfor %}
+
+    {{ ns.items }}
+
+  problem_count: >
+    {{ offenders | count }}
+
+  problem_names: >
+    {% set ns = namespace(items=[]) %}
+
+    {% for entity in offenders %}
+      {% set name = state_attr(entity, 'friendly_name') or entity %}
+      {% set ns.items = ns.items + [name] %}
+    {% endfor %}
+
+    {{ ns.items | join(', ') }}
+
+  details: >
+    Mulig fast åben ventil i {{ problem_count }} rum: {{ problem_names }}.
+
+condition:
+  - condition: template
+    value_template: >
+      {{ problem_count | int(0) > 0 }}
+
+  - condition: template
+    value_template: >
+      {% set last_triggered = this.attributes.last_triggered %}
+
+      {{ last_triggered is none
+        or as_timestamp(now()) - as_timestamp(last_triggered)
+            > cooldown_minutes | int(0) * 60 }}
+
+action:
+  - sequence: !input reaction_actions
+
+mode: single

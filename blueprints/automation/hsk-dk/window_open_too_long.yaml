@@ -1,0 +1,302 @@
+blueprint:
+  name: Vindue åbent for længe v3
+  description: >
+    Sender påmindelser, når et vindue har været åbent for længe.
+    Første ventetid afhænger af udetemperaturen og eventuel aktiv varme
+    i rummet. Derefter sendes påmindelser med et fast interval, så længe
+    vinduet stadig er åbent. Notifikationen ryddes automatisk, når
+    vinduet lukkes.
+  domain: automation
+  source_url: https://github.com/hsk-dk/useful-blueprints/blob/main/blueprints/automation/hsk-dk/window_open_too_long.yaml
+  input:
+    window_entity:
+      name: Vindue-sensor
+      selector:
+        entity:
+          domain: binary_sensor
+
+    outdoor_temp_entity:
+      name: Temperatur-sensor
+      description: Sensor, der bruges til valg af første ventetid.
+      selector:
+        entity:
+          domain: sensor
+
+    climate_entity:
+      name: Climate-enhed
+      description: >
+        Valgfri. Hvis enheden aktivt varmer, bruges den korte
+        ventetid for aktiv varme.
+      default: ""
+      selector:
+        entity:
+          domain: climate
+
+    notification_script:
+      name: Notifikationsscript
+      description: >
+        Scriptet "Notifikation til dem der er hjemme".
+      selector:
+        entity:
+          domain: script
+
+    room_name:
+      name: Rumnavn
+      description: Bruges i notifikationens titel og besked.
+      selector:
+        text:
+
+    notification_tag:
+      name: Notifikationstag
+      description: >
+        Obligatorisk og unikt tag for dette vindue.
+        Eksempel: bathroom_window.
+      selector:
+        text:
+
+    cold_temp_threshold:
+      name: Temperaturgrænse
+      description: Under denne temperatur bruges den kolde ventetid.
+      default: 15
+      selector:
+        number:
+          min: -20
+          max: 40
+          step: 1
+          mode: box
+          unit_of_measurement: "°C"
+
+    delay_when_heating:
+      name: Første ventetid, når varmen kører
+      default: 10
+      selector:
+        number:
+          min: 1
+          max: 120
+          step: 1
+          mode: box
+          unit_of_measurement: min
+
+    delay_when_cold:
+      name: Første ventetid, når det er koldt
+      default: 20
+      selector:
+        number:
+          min: 1
+          max: 240
+          step: 1
+          mode: box
+          unit_of_measurement: min
+
+    delay_when_mild:
+      name: Første ventetid, når det ikke er koldt
+      default: 45
+      selector:
+        number:
+          min: 1
+          max: 240
+          step: 1
+          mode: box
+          unit_of_measurement: min
+
+    repeat_delay:
+      name: Gentagelsesinterval
+      default: 20
+      selector:
+        number:
+          min: 1
+          max: 240
+          step: 1
+          mode: box
+          unit_of_measurement: min
+
+    sound:
+      name: Lyd
+      description: >
+        Navnet på en lyd, der understøttes af iOS Companion App.
+      default: default
+      selector:
+        text:
+
+    interruption_level:
+      name: Afbrydelsesniveau
+      default: active
+      selector:
+        select:
+          options:
+            - passive
+            - active
+            - time-sensitive
+            - critical
+
+mode: restart
+max_exceeded: silent
+
+triggers:
+  - trigger: state
+    entity_id: !input window_entity
+    to: "on"
+    id: window_opened
+
+  - trigger: state
+    entity_id: !input window_entity
+    to: "off"
+    id: window_closed
+
+variables:
+  window_entity: !input window_entity
+  outdoor_temp_entity: !input outdoor_temp_entity
+  climate_entity: !input climate_entity
+  notification_script: !input notification_script
+
+  room_name: !input room_name
+  notification_tag: !input notification_tag
+
+  cold_temp_threshold: !input cold_temp_threshold
+  delay_when_heating: !input delay_when_heating
+  delay_when_cold: !input delay_when_cold
+  delay_when_mild: !input delay_when_mild
+  repeat_delay: !input repeat_delay
+
+  sound: !input sound
+  interruption_level: !input interruption_level
+
+  normalized_tag: "{{ notification_tag | string | trim }}"
+
+  temperature_is_valid: >-
+    {{
+      states(outdoor_temp_entity)
+      not in ['unknown', 'unavailable', 'none', '']
+    }}
+
+  current_temp: >-
+    {{
+      states(outdoor_temp_entity) | float
+      if temperature_is_valid
+      else none
+    }}
+
+  heating_at_open: >-
+    {{
+      climate_entity | string | trim != ''
+      and state_attr(climate_entity, 'hvac_action') == 'heating'
+    }}
+
+  first_delay_minutes: >-
+    {% if heating_at_open %}
+      {{ delay_when_heating | int }}
+    {% elif current_temp is not none
+          and current_temp < (cold_temp_threshold | float) %}
+      {{ delay_when_cold | int }}
+    {% else %}
+      {{ delay_when_mild | int }}
+    {% endif %}
+
+actions:
+  - choose:
+      - conditions:
+          - condition: trigger
+            id: window_closed
+          - condition: template
+            value_template: "{{ normalized_tag | length > 0 }}"
+        sequence:
+          - action: script.turn_on
+            target:
+              entity_id: !input notification_script
+            data:
+              variables:
+                title: "OBS - {{ room_name }}"
+                message: ""
+                tag: "{{ normalized_tag }}"
+                sound: "{{ sound }}"
+                interruption_level: "{{ interruption_level }}"
+                clear: true
+
+      - conditions:
+          - condition: trigger
+            id: window_opened
+          - condition: template
+            value_template: "{{ normalized_tag | length > 0 }}"
+        sequence:
+          - delay:
+              minutes: "{{ first_delay_minutes | int }}"
+
+          - if:
+              - condition: state
+                entity_id: !input window_entity
+                state: "on"
+            then:
+              - action: script.turn_on
+                target:
+                  entity_id: !input notification_script
+                data:
+                  variables:
+                    title: "OBS - {{ room_name }}"
+                    message: >-
+                      {% set heating_now =
+                        climate_entity | string | trim != ''
+                        and state_attr(
+                          climate_entity,
+                          'hvac_action'
+                        ) == 'heating'
+                      %}
+                      {% if heating_now %}
+                        Vinduet i {{ room_name }} har været åbent i mere end
+                        {{ first_delay_minutes | int }} minutter, mens varmen
+                        er tændt.
+                      {% else %}
+                        Vinduet i {{ room_name }} har været åbent i mere end
+                        {{ first_delay_minutes | int }} minutter.
+                      {% endif %}
+                    tag: "{{ normalized_tag }}"
+                    sound: "{{ sound }}"
+                    interruption_level: "{{ interruption_level }}"
+                    clear: false
+
+              - repeat:
+                  while:
+                    - condition: state
+                      entity_id: !input window_entity
+                      state: "on"
+                  sequence:
+                    - delay:
+                        minutes: !input repeat_delay
+
+                    - if:
+                        - condition: state
+                          entity_id: !input window_entity
+                          state: "on"
+                      then:
+                        - action: script.turn_on
+                          target:
+                            entity_id: !input notification_script
+                          data:
+                            variables:
+                              title: "OBS - {{ room_name }}"
+                              message: >-
+                                {% set total =
+                                  (first_delay_minutes | int)
+                                  + (
+                                    repeat.index
+                                    * (repeat_delay | int)
+                                  )
+                                %}
+                                {% set heating_now =
+                                  climate_entity | string | trim != ''
+                                  and state_attr(
+                                    climate_entity,
+                                    'hvac_action'
+                                  ) == 'heating'
+                                %}
+                                {% if heating_now %}
+                                  Vinduet i {{ room_name }} har været åbent
+                                  i mere end {{ total }} minutter, mens
+                                  varmen er tændt.
+                                {% else %}
+                                  Vinduet i {{ room_name }} har været åbent
+                                  i mere end {{ total }} minutter.
+                                {% endif %}
+                              tag: "{{ normalized_tag }}"
+                              sound: "{{ sound }}"
+                              interruption_level: "{{ interruption_level }}"
+                              clear: false

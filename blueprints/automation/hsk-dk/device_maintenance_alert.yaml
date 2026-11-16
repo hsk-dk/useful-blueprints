@@ -1,0 +1,354 @@
+blueprint:
+  name: Device Maintenance Alert
+  description: >
+    Opretter automatisk vedligeholdelsesalarmer med notifikationer og (valgfrit) todo-opgaver
+    når en enhed kræver service (f.eks. filter, salt, rengøring).
+  domain: automation
+  source_url: https://github.com/hsk-dk/useful-blueprints/blob/main/blueprints/automation/hsk-dk/device_maintenance_alert.yaml
+  input:
+    # Obligatoriske inputs
+    trigger_sensor:
+      name: Status Sensor
+      description: Sensor der indikerer om vedligeholdelse er nødvendig (binary_sensor eller sensor)
+      selector:
+        entity:
+          filter:
+            domain: [binary_sensor, sensor]
+
+    device_name:
+      name: Enhedsnavn
+      description: Navn på enheden (f.eks. "Emhætte", "Opvaskemaskine")
+      selector:
+        text:
+
+    maintenance_type:
+      name: Vedligeholdelsestype
+      description: Type vedligeholdelse (f.eks. "filter rensning", "salt påfyldning")
+      selector:
+        text:
+
+    # Trigger værdier
+    trigger_value_required:
+      name: Sensor værdi når vedligeholdelse kræves
+      description: Værdi der indikerer vedligeholdelse er nødvendig (f.eks. "on", "true", "low")
+      default: "on"
+      selector:
+        text:
+
+    trigger_value_completed:
+      name: Sensor værdi når vedligeholdelse er fuldført
+      description: Værdi der indikerer vedligeholdelse er fuldført (f.eks. "off", "false", "ok")
+      default: "off"
+      selector:
+        text:
+
+    # Debounce / stabilisering
+    required_stable_for:
+      name: Krævet-stabil i mindst
+      description: Hvor længe sensoren skal være i "krævet"-tilstand før flowet starter.
+      default:
+        hours: 0
+        minutes: 0
+        seconds: 5
+      selector:
+        duration:
+
+    completed_stable_for:
+      name: Fuldført-stabil i mindst
+      description: Hvor længe sensoren skal være i "fuldført"-tilstand før flowet starter.
+      default:
+        hours: 0
+        minutes: 0
+        seconds: 5
+      selector:
+        duration:
+
+    # Valgfrie inputs
+    notify_device:
+      name: Enhed til notifikationer (valgfri)
+      description: (Valgfri) Vælg den mobile enhed der skal modtage notifikationer (kræver Home Assistant app)
+      default: ""
+      selector:
+        device:
+          integration: mobile_app
+
+    todo_entity:
+      name: Todo Liste (valgfri)
+      description: (Valgfri) Todo entity til at oprette opgaver. Lad være tom for at deaktivere todo.
+      default: ""
+      selector:
+        entity:
+          domain: todo
+
+    # Forfald (valgfri) - fast dato/tid
+    todo_due_date:
+      name: Forfaldsdato (valgfri)
+      description: (Valgfri) Sæt forfaldsdato på todo-opgaven (dato).
+      default: ""
+      selector:
+        date:
+
+    todo_due_datetime:
+      name: Forfaldsdato + tidspunkt (valgfri)
+      description: (Valgfri) Sæt forfaldsdato og tidspunkt på todo-opgaven. (Overstyrer dato hvis begge udfyldes)
+      default: ""
+      selector:
+        datetime:
+
+    # Forfald (valgfri) - offset dage
+    todo_due_offset_days:
+      name: Forfald om X dage (valgfri)
+      description: (Valgfri) Sæt forfaldsdato til i dag + X dage. Bruges kun hvis fast dato/tid ikke er udfyldt.
+      default: 0
+      selector:
+        number:
+          min: 0
+          max: 365
+          step: 1
+          mode: box
+
+    maintenance_instructions:
+      name: Vedligeholdelses instruktioner
+      description: Detaljerede trin til vedligeholdelse
+      default: ""
+      selector:
+        text:
+          multiline: true
+
+variables:
+  device_name: !input device_name
+  maintenance_type: !input maintenance_type
+  trigger_value_required: !input trigger_value_required
+  trigger_value_completed: !input trigger_value_completed
+  notify_device: !input notify_device
+  todo_entity: !input todo_entity
+  todo_due_date: !input todo_due_date
+  todo_due_datetime: !input todo_due_datetime
+  todo_due_offset_days: !input todo_due_offset_days
+  maintenance_instructions: !input maintenance_instructions
+  trigger_sensor: !input trigger_sensor
+
+  # Genererede variabler
+  task_subject: "{{ device_name }} {{ maintenance_type }}"
+  notification_message: "{{ device_name }} kræver {{ maintenance_type }}"
+
+  # Alarm status baseret på sensor
+  maintenance_required: "{{ states(trigger_sensor) == trigger_value_required }}"
+
+  # Feature toggles (valgfri inputs)
+  todo_enabled: "{{ todo_entity is string and todo_entity | length > 0 }}"
+  notify_enabled: "{{ notify_device is string and notify_device | length > 0 }}"
+
+  # Due toggles
+  due_date_enabled: "{{ todo_due_date is string and todo_due_date | length > 0 }}"
+  due_datetime_enabled: "{{ todo_due_datetime is string and todo_due_datetime | length > 0 }}"
+  due_offset_enabled: "{{ (todo_due_offset_days | int(0)) > 0 }}"
+
+  # Beregnet forfaldsdato (i dag + offset dage)
+  computed_due_date: "{{ (now().date() + timedelta(days=(todo_due_offset_days | int(0)))).isoformat() }}"
+
+mode: single
+
+triggers:
+  - alias: "Vedligeholdelse kræves"
+    trigger: state
+    entity_id: !input trigger_sensor
+    to: !input trigger_value_required
+    for: !input required_stable_for
+    id: maintenance_required
+    not_from:
+      - unavailable
+      - unknown
+
+  - alias: "Vedligeholdelse fuldført"
+    trigger: state
+    entity_id: !input trigger_sensor
+    to: !input trigger_value_completed
+    for: !input completed_stable_for
+    id: maintenance_completed
+    not_from:
+      - unavailable
+      - unknown
+
+conditions:
+  # Sikr at trigger sensor er tilgængelig
+  - condition: template
+    value_template: >
+      {{ states(trigger_sensor) not in ['unknown', 'unavailable', None] }}
+
+actions:
+  - choose:
+      # Vedligeholdelse kræves - send notifikation og evt. opret todo
+      - conditions:
+          - condition: trigger
+            id: maintenance_required
+        sequence:
+          # Notifikation (valgfri)
+          - choose:
+              - conditions:
+                  - condition: template
+                    value_template: "{{ notify_enabled }}"
+                sequence:
+                  - device_id: !input notify_device
+                    domain: mobile_app
+                    type: notify
+                    title: "{{ device_name }} Vedligeholdelse"
+                    message: "{{ notification_message }}"
+
+          # Todo (valgfri, generisk via core todo.*)
+          - choose:
+              - conditions:
+                  - condition: template
+                    value_template: "{{ todo_enabled }}"
+                sequence:
+                  # Hent åbne items og undgå dubletter
+                  - action: todo.get_items
+                    target:
+                      entity_id: "{{ todo_entity }}"
+                    data:
+                      status:
+                        - needs_action
+                    response_variable: todo_items_open
+
+                  - condition: template
+                    value_template: >
+                      {% set key = todo_entity %}
+                      {% set items = (todo_items_open[key]['items'] if (todo_items_open is mapping and key in todo_items_open and 'items' in todo_items_open[key]) else []) %}
+                      {% set matches = items
+                        | selectattr('summary', 'eq', task_subject)
+                        | selectattr('status', 'eq', 'needs_action')
+                        | list %}
+                      {{ matches | length == 0 }}
+
+                  # Opret todo med (valgfri) forfald - prioritet:
+                  # 1) due_datetime, 2) due_date, 3) offset dage -> due_date, 4) ingen
+                  # todo.add_item understøtter due_date eller due_datetime (kun én ad gangen)
+                  - choose:
+                      - conditions:
+                          - condition: template
+                            value_template: "{{ due_datetime_enabled }}"
+                        sequence:
+                          - action: todo.add_item
+                            target:
+                              entity_id: "{{ todo_entity }}"
+                            data:
+                              item: "{{ task_subject }}"
+                              due_datetime: "{{ todo_due_datetime }}"
+                              description: >
+                                {{ device_name }} kræver {{ maintenance_type }}.
+                                {% if maintenance_instructions != '' %}
+                                Instruktioner:
+                                {{ maintenance_instructions }}
+                                {% else %}
+                                Udfør nødvendig vedligeholdelse og nulstil alarm på enheden.
+                                {% endif %}
+
+                      - conditions:
+                          - condition: template
+                            value_template: "{{ (not due_datetime_enabled) and due_date_enabled }}"
+                        sequence:
+                          - action: todo.add_item
+                            target:
+                              entity_id: "{{ todo_entity }}"
+                            data:
+                              item: "{{ task_subject }}"
+                              due_date: "{{ todo_due_date }}"
+                              description: >
+                                {{ device_name }} kræver {{ maintenance_type }}.
+                                {% if maintenance_instructions != '' %}
+                                Instruktioner:
+                                {{ maintenance_instructions }}
+                                {% else %}
+                                Udfør nødvendig vedligeholdelse og nulstil alarm på enheden.
+                                {% endif %}
+
+                      - conditions:
+                          - condition: template
+                            value_template: "{{ (not due_datetime_enabled) and (not due_date_enabled) and due_offset_enabled }}"
+                        sequence:
+                          - action: todo.add_item
+                            target:
+                              entity_id: "{{ todo_entity }}"
+                            data:
+                              item: "{{ task_subject }}"
+                              due_date: "{{ computed_due_date }}"
+                              description: >
+                                {{ device_name }} kræver {{ maintenance_type }}.
+                                {% if maintenance_instructions != '' %}
+                                Instruktioner:
+                                {{ maintenance_instructions }}
+                                {% else %}
+                                Udfør nødvendig vedligeholdelse og nulstil alarm på enheden.
+                                {% endif %}
+
+                    default:
+                      - action: todo.add_item
+                        target:
+                          entity_id: "{{ todo_entity }}"
+                        data:
+                          item: "{{ task_subject }}"
+                          description: >
+                            {{ device_name }} kræver {{ maintenance_type }}.
+                            {% if maintenance_instructions != '' %}
+                            Instruktioner:
+                            {{ maintenance_instructions }}
+                            {% else %}
+                            Udfør nødvendig vedligeholdelse og nulstil alarm på enheden.
+                            {% endif %}
+
+      # Vedligeholdelse fuldført - send bekræftelse og evt. marker todos som fuldført
+      - conditions:
+          - condition: trigger
+            id: maintenance_completed
+        sequence:
+          # Notifikation (valgfri)
+          - choose:
+              - conditions:
+                  - condition: template
+                    value_template: "{{ notify_enabled }}"
+                sequence:
+                  - device_id: !input notify_device
+                    domain: mobile_app
+                    type: notify
+                    title: "{{ device_name }} Vedligeholdelse"
+                    message: "{{ device_name }} vedligeholdelse fuldført"
+
+          # Todo complete (valgfri, generisk via core todo.*)
+          - choose:
+              - conditions:
+                  - condition: template
+                    value_template: "{{ todo_enabled }}"
+                sequence:
+                  # Hent åbne items og find match (UIDs)
+                  - action: todo.get_items
+                    target:
+                      entity_id: "{{ todo_entity }}"
+                    data:
+                      status:
+                        - needs_action
+                    response_variable: todo_items_open
+
+                  - repeat:
+                      for_each: >
+                        {% set key = todo_entity %}
+                        {% set items = (todo_items_open[key]['items'] if (todo_items_open is mapping and key in todo_items_open and 'items' in todo_items_open[key]) else []) %}
+                        {{ items
+                          | selectattr('summary', 'eq', task_subject)
+                          | selectattr('status', 'eq', 'needs_action')
+                          | map(attribute='uid')
+                          | list }}
+                      sequence:
+                        - action: todo.update_item
+                          target:
+                            entity_id: "{{ todo_entity }}"
+                          data:
+                            # update_item kan tage item som UID eller navn; vi bruger UID for entydighed
+                            item: "{{ repeat.item }}"
+                            status: "completed"
+
+    # Fallback
+    default:
+      - action: system_log.write
+        data:
+          message: "Uventet trigger i {{ device_name }} vedligeholdelse automation: {{ trigger.id }}"
+          level: warning
