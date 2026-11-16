@@ -1,0 +1,213 @@
+blueprint:
+  name: IKEA BILRESA (2 knapper) - lys med fade og natdæmpning
+  description: >
+    Styrer ét lys med IKEA BILRESA to-knaps (Zigbee2MQTT).
+
+    - Tænd: fader langsomt op. I nat-tidsrummet tændes kun til svag lysstyrke.
+
+    - Dobbelttryk på tænd: fuld lysstyrke.
+
+    - Hold tænd/sluk inde: skruer lysstyrken op/ned (ca. ét trin pr. sekund).
+
+    - Sluk: fader ned og slukker.
+  domain: automation
+  source_url: https://github.com/hsk-dk/useful-blueprints/blob/main/blueprints/automation/hsk-dk/ikea_bilresa_light_fade.yaml
+  homeassistant:
+    min_version: "2024.10.0"
+  input:
+    devices:
+      name: Enheder
+      icon: mdi:remote
+      input:
+        action_sensor:
+          name: BILRESA action-sensor
+          description: Z2M "Action"-sensoren for knappen (sensor.xxx_action).
+          selector:
+            entity:
+              domain: sensor
+              integration: mqtt
+        target_light:
+          name: Lys
+          selector:
+            entity:
+              domain: light
+    settings:
+      name: Indstillinger
+      icon: mdi:cog
+      input:
+        night_start:
+          name: Nat starter
+          default: "20:00:00"
+          selector:
+            time: {}
+        night_end:
+          name: Nat slutter
+          default: "07:00:00"
+          selector:
+            time: {}
+        night_brightness:
+          name: Lysstyrke om natten
+          default: 10
+          selector:
+            number:
+              min: 1
+              max: 100
+              unit_of_measurement: "%"
+        full_brightness:
+          name: Fuld lysstyrke (dag og dobbelttryk)
+          default: 85
+          selector:
+            number:
+              min: 1
+              max: 100
+              unit_of_measurement: "%"
+        fade_up_seconds:
+          name: Fade op (sekunder)
+          default: 5
+          selector:
+            number:
+              min: 0
+              max: 60
+              unit_of_measurement: s
+        fade_to_full_seconds:
+          name: Fade til fuld lysstyrke ved dobbelttryk (sekunder)
+          default: 1
+          selector:
+            number:
+              min: 0
+              max: 60
+              unit_of_measurement: s
+        fade_down_seconds:
+          name: Fade ned ved sluk (sekunder)
+          default: 3
+          selector:
+            number:
+              min: 0
+              max: 60
+              unit_of_measurement: s
+        dim_step_pct:
+          name: Hold inde - trin pr. sekund
+          description: Hvor mange procent lysstyrken ændres pr. sekund, mens du holder en knap inde.
+          default: 10
+          selector:
+            number:
+              min: 1
+              max: 50
+              unit_of_measurement: "%"
+
+mode: restart
+max_exceeded: silent
+
+variables:
+  light_entity: !input target_light
+  night_brightness: !input night_brightness
+  full_brightness: !input full_brightness
+  fade_up_seconds: !input fade_up_seconds
+  fade_to_full_seconds: !input fade_to_full_seconds
+  fade_down_seconds: !input fade_down_seconds
+  dim_step_pct: !input dim_step_pct
+
+triggers:
+  - trigger: state
+    entity_id: !input action_sensor
+    to: "on"
+    id: "on"
+  - trigger: state
+    entity_id: !input action_sensor
+    to: "on_double"
+    id: "on_double"
+  - trigger: state
+    entity_id: !input action_sensor
+    to: "off"
+    id: "off"
+  - trigger: state
+    entity_id: !input action_sensor
+    to: "brightness_move_up"
+    id: "dim_up"
+  - trigger: state
+    entity_id: !input action_sensor
+    to: "brightness_move_down"
+    id: "dim_down"
+
+conditions:
+  - condition: not
+    conditions:
+      - condition: state
+        entity_id: !input target_light
+        state: unavailable
+
+actions:
+  - choose:
+      - alias: Tænd - fade op (svagt om natten)
+        conditions:
+          - condition: trigger
+            id: "on"
+        sequence:
+          - if:
+              - condition: time
+                after: !input night_start
+                before: !input night_end
+            then:
+              - action: light.turn_on
+                target:
+                  entity_id: !input target_light
+                data:
+                  brightness_pct: "{{ night_brightness | int }}"
+                  transition: "{{ fade_up_seconds | int }}"
+            else:
+              - action: light.turn_on
+                target:
+                  entity_id: !input target_light
+                data:
+                  brightness_pct: "{{ full_brightness | int }}"
+                  transition: "{{ fade_up_seconds | int }}"
+      - alias: Dobbelttryk - fuld lysstyrke
+        conditions:
+          - condition: trigger
+            id: "on_double"
+        sequence:
+          - action: light.turn_on
+            target:
+              entity_id: !input target_light
+            data:
+              brightness_pct: "{{ full_brightness | int }}"
+              transition: "{{ fade_to_full_seconds | int }}"
+      - alias: Hold tænd - lysere
+        conditions:
+          - condition: trigger
+            id: "dim_up"
+        sequence:
+          - action: light.turn_on
+            target:
+              entity_id: !input target_light
+            data:
+              brightness_pct: >-
+                {% set cur = (state_attr(light_entity, 'brightness') | default(0, true)) / 2.55 %}
+                {{ [100, (cur + dim_step_pct | float) | round(0)] | min | int }}
+              transition: 1
+      - alias: Hold sluk - mørkere (aldrig helt ud)
+        conditions:
+          - condition: trigger
+            id: "dim_down"
+          - condition: state
+            entity_id: !input target_light
+            state: "on"
+        sequence:
+          - action: light.turn_on
+            target:
+              entity_id: !input target_light
+            data:
+              brightness_pct: >-
+                {% set cur = (state_attr(light_entity, 'brightness') | default(0, true)) / 2.55 %}
+                {{ [1, (cur - dim_step_pct | float) | round(0)] | max | int }}
+              transition: 1
+      - alias: Sluk - fade ned
+        conditions:
+          - condition: trigger
+            id: "off"
+        sequence:
+          - action: light.turn_off
+            target:
+              entity_id: !input target_light
+            data:
+              transition: "{{ fade_down_seconds | int }}"
