@@ -6,6 +6,12 @@ blueprint:
     i rummet. Derefter sendes påmindelser med et fast interval, så længe
     vinduet stadig er åbent. Notifikationen ryddes automatisk, når
     vinduet lukkes.
+
+    Valgfrit: Sænk temperaturen på climate-enheden, når vinduet har
+    været åbent i en periode, og gendan den oprindelige temperatur, når
+    vinduet lukkes. Angiv en input_number-hjælper til at gemme den
+    oprindelige temperatur, så den kan gendannes selv efter en
+    genstart af Home Assistant.
   domain: automation
   source_url: https://github.com/hsk-dk/useful-blueprints/blob/main/blueprints/automation/hsk-dk/window_open_too_long.yaml
   input:
@@ -50,7 +56,8 @@ blueprint:
       name: Notifikationstag
       description: >
         Obligatorisk og unikt tag for dette vindue.
-        Eksempel: bathroom_window.
+        Eksempel: bathroom_window. Bruges også til at navngive den
+        midlertidige gendannelsesscene, hvis der ikke er valgt en hjælper.
       selector:
         text:
 
@@ -129,6 +136,66 @@ blueprint:
             - time-sensitive
             - critical
 
+    lower_temp_enabled:
+      name: Sænk temperaturen, mens vinduet er åbent
+      description: >
+        Kræver en climate-enhed. Når vinduet har været åbent i "Sænk
+        efter" minutter, gemmes den nuværende måltemperatur, og
+        måltemperaturen sænkes. Når vinduet lukkes, gendannes den
+        gemte temperatur.
+      default: false
+      selector:
+        boolean:
+
+    lower_after_minutes:
+      name: Sænk efter
+      description: Hvor længe vinduet skal have været åbent, før temperaturen sænkes.
+      default: 15
+      selector:
+        number:
+          min: 1
+          max: 120
+          step: 1
+          mode: box
+          unit_of_measurement: min
+
+    temp_drop:
+      name: Sænkning af måltemperatur
+      default: 4
+      selector:
+        number:
+          min: 0.5
+          max: 15
+          step: 0.5
+          mode: box
+          unit_of_measurement: "°C"
+
+    min_lowered_temp:
+      name: Laveste sænkede temperatur
+      description: >
+        Måltemperaturen sænkes aldrig under dette (og aldrig over den
+        nuværende).
+      default: 12
+      selector:
+        number:
+          min: 5
+          max: 25
+          step: 0.5
+          mode: box
+          unit_of_measurement: "°C"
+
+    saved_temp_helper:
+      name: Hjælper til gemt temperatur
+      description: >
+        Valgfri input_number (min 0), som gemmer den oprindelige
+        måltemperatur, mens den er sænket (0 = ikke sænket). Opret den
+        uden "initial", så værdien huskes efter en genstart. Uden
+        hjælper bruges en midlertidig scene, som går tabt ved genstart.
+      default: ""
+      selector:
+        entity:
+          domain: input_number
+
 mode: restart
 max_exceeded: silent
 
@@ -161,7 +228,20 @@ variables:
   sound: !input sound
   interruption_level: !input interruption_level
 
+  lower_temp_enabled: !input lower_temp_enabled
+  lower_after_minutes: !input lower_after_minutes
+  temp_drop: !input temp_drop
+  min_lowered_temp: !input min_lowered_temp
+  saved_temp_helper: !input saved_temp_helper
+
   normalized_tag: "{{ notification_tag | string | trim }}"
+
+  use_helper: "{{ saved_temp_helper | string | trim != '' }}"
+
+  pause_scene_id: >-
+    window_pause_{{ normalized_tag | lower | regex_replace('[^a-z0-9]+', '_') }}
+
+  pause_scene_entity: "scene.{{ pause_scene_id }}"
 
   temperature_is_valid: >-
     {{
@@ -212,91 +292,185 @@ actions:
                 interruption_level: "{{ interruption_level }}"
                 clear: true
 
+          - alias: Gendan temperatur, hvis den blev sænket
+            if:
+              - condition: template
+                value_template: >-
+                  {{ lower_temp_enabled
+                     and climate_entity | string | trim != '' }}
+            then:
+              - choose:
+                  - conditions:
+                      - condition: template
+                        value_template: >-
+                          {{ use_helper
+                             and states(saved_temp_helper) | float(0) > 0 }}
+                    sequence:
+                      - action: climate.set_temperature
+                        target:
+                          entity_id: "{{ climate_entity }}"
+                        data:
+                          temperature: "{{ states(saved_temp_helper) | float }}"
+                      - action: input_number.set_value
+                        target:
+                          entity_id: "{{ saved_temp_helper }}"
+                        data:
+                          value: 0
+
+                  - conditions:
+                      - condition: template
+                        value_template: >-
+                          {{ not use_helper
+                             and is_state(pause_scene_entity, 'unknown') }}
+                    sequence:
+                      - action: scene.turn_on
+                        target:
+                          entity_id: "{{ pause_scene_entity }}"
+                        continue_on_error: true
+
       - conditions:
           - condition: trigger
             id: window_opened
           - condition: template
             value_template: "{{ normalized_tag | length > 0 }}"
         sequence:
-          - delay:
-              minutes: "{{ first_delay_minutes | int }}"
+          - parallel:
+              - alias: Påmindelser
+                sequence:
+                  - delay:
+                      minutes: "{{ first_delay_minutes | int }}"
 
-          - if:
-              - condition: state
-                entity_id: !input window_entity
-                state: "on"
-            then:
-              - action: script.turn_on
-                target:
-                  entity_id: !input notification_script
-                data:
-                  variables:
-                    title: "OBS - {{ room_name }}"
-                    message: >-
-                      {% set heating_now =
-                        climate_entity | string | trim != ''
-                        and state_attr(
-                          climate_entity,
-                          'hvac_action'
-                        ) == 'heating'
-                      %}
-                      {% if heating_now %}
-                        Vinduet i {{ room_name }} har været åbent i mere end
-                        {{ first_delay_minutes | int }} minutter, mens varmen
-                        er tændt.
-                      {% else %}
-                        Vinduet i {{ room_name }} har været åbent i mere end
-                        {{ first_delay_minutes | int }} minutter.
-                      {% endif %}
-                    tag: "{{ normalized_tag }}"
-                    sound: "{{ sound }}"
-                    interruption_level: "{{ interruption_level }}"
-                    clear: false
+                  - if:
+                      - condition: state
+                        entity_id: !input window_entity
+                        state: "on"
+                    then:
+                      - action: script.turn_on
+                        target:
+                          entity_id: !input notification_script
+                        data:
+                          variables:
+                            title: "OBS - {{ room_name }}"
+                            message: >-
+                              {% set heating_now =
+                                climate_entity | string | trim != ''
+                                and state_attr(
+                                  climate_entity,
+                                  'hvac_action'
+                                ) == 'heating'
+                              %}
+                              {% if heating_now %}
+                                Vinduet i {{ room_name }} har været åbent i mere end
+                                {{ first_delay_minutes | int }} minutter, mens varmen
+                                er tændt.
+                              {% else %}
+                                Vinduet i {{ room_name }} har været åbent i mere end
+                                {{ first_delay_minutes | int }} minutter.
+                              {% endif %}
+                            tag: "{{ normalized_tag }}"
+                            sound: "{{ sound }}"
+                            interruption_level: "{{ interruption_level }}"
+                            clear: false
 
-              - repeat:
-                  while:
-                    - condition: state
-                      entity_id: !input window_entity
-                      state: "on"
-                  sequence:
-                    - delay:
-                        minutes: !input repeat_delay
+                      - repeat:
+                          while:
+                            - condition: state
+                              entity_id: !input window_entity
+                              state: "on"
+                          sequence:
+                            - delay:
+                                minutes: !input repeat_delay
 
-                    - if:
-                        - condition: state
-                          entity_id: !input window_entity
-                          state: "on"
-                      then:
-                        - action: script.turn_on
-                          target:
-                            entity_id: !input notification_script
-                          data:
-                            variables:
-                              title: "OBS - {{ room_name }}"
-                              message: >-
-                                {% set total =
-                                  (first_delay_minutes | int)
-                                  + (
-                                    repeat.index
-                                    * (repeat_delay | int)
-                                  )
-                                %}
-                                {% set heating_now =
-                                  climate_entity | string | trim != ''
-                                  and state_attr(
-                                    climate_entity,
-                                    'hvac_action'
-                                  ) == 'heating'
-                                %}
-                                {% if heating_now %}
-                                  Vinduet i {{ room_name }} har været åbent
-                                  i mere end {{ total }} minutter, mens
-                                  varmen er tændt.
-                                {% else %}
-                                  Vinduet i {{ room_name }} har været åbent
-                                  i mere end {{ total }} minutter.
-                                {% endif %}
-                              tag: "{{ normalized_tag }}"
-                              sound: "{{ sound }}"
-                              interruption_level: "{{ interruption_level }}"
-                              clear: false
+                            - if:
+                                - condition: state
+                                  entity_id: !input window_entity
+                                  state: "on"
+                              then:
+                                - action: script.turn_on
+                                  target:
+                                    entity_id: !input notification_script
+                                  data:
+                                    variables:
+                                      title: "OBS - {{ room_name }}"
+                                      message: >-
+                                        {% set total =
+                                          (first_delay_minutes | int)
+                                          + (
+                                            repeat.index
+                                            * (repeat_delay | int)
+                                          )
+                                        %}
+                                        {% set heating_now =
+                                          climate_entity | string | trim != ''
+                                          and state_attr(
+                                            climate_entity,
+                                            'hvac_action'
+                                          ) == 'heating'
+                                        %}
+                                        {% if heating_now %}
+                                          Vinduet i {{ room_name }} har været åbent
+                                          i mere end {{ total }} minutter, mens
+                                          varmen er tændt.
+                                        {% else %}
+                                          Vinduet i {{ room_name }} har været åbent
+                                          i mere end {{ total }} minutter.
+                                        {% endif %}
+                                      tag: "{{ normalized_tag }}"
+                                      sound: "{{ sound }}"
+                                      interruption_level: "{{ interruption_level }}"
+                                      clear: false
+
+              - alias: Sænk temperatur
+                sequence:
+                  - if:
+                      - condition: template
+                        value_template: >-
+                          {{ lower_temp_enabled
+                             and climate_entity | string | trim != '' }}
+                    then:
+                      - delay:
+                          minutes: !input lower_after_minutes
+
+                      - if:
+                          - condition: state
+                            entity_id: !input window_entity
+                            state: "on"
+                          - condition: template
+                            value_template: >-
+                              {{ is_state(climate_entity, 'heat')
+                                 and state_attr(climate_entity, 'temperature') | is_number
+                                 and not (
+                                   states(saved_temp_helper) | float(0) > 0
+                                   if use_helper
+                                   else is_state(pause_scene_entity, 'unknown')
+                                 ) }}
+                        then:
+                          - variables:
+                              current_target: "{{ state_attr(climate_entity, 'temperature') | float }}"
+                              lowered_target: >-
+                                {{ [[current_target - (temp_drop | float),
+                                     (min_lowered_temp | float)] | max,
+                                    current_target] | min }}
+
+                          - choose:
+                              - conditions:
+                                  - condition: template
+                                    value_template: "{{ use_helper }}"
+                                sequence:
+                                  - action: input_number.set_value
+                                    target:
+                                      entity_id: "{{ saved_temp_helper }}"
+                                    data:
+                                      value: "{{ current_target }}"
+                            default:
+                              - action: scene.create
+                                data:
+                                  scene_id: "{{ pause_scene_id }}"
+                                  snapshot_entities:
+                                    - "{{ climate_entity }}"
+
+                          - action: climate.set_temperature
+                            target:
+                              entity_id: "{{ climate_entity }}"
+                            data:
+                              temperature: "{{ lowered_target }}"
